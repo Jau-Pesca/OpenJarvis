@@ -160,6 +160,7 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
                         pass
         payload: Dict[str, Any] = {
             "model": model,
+            "keep_alive": kwargs.get("keep_alive", "5m"),
             "messages": msg_dicts,
             "stream": False,
             "options": _ollama_request_options(
@@ -188,7 +189,8 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
             if isinstance(response_format, ResponseFormat):
                 payload["format"] = "json"
             elif isinstance(response_format, dict):
-                payload["format"] = "json"
+                schema = response_format.get("json_schema", {}).get("schema") if response_format.get("type") == "json_schema" else None
+                payload["format"] = schema if isinstance(schema, dict) else "json"
         try:
             resp = self._client.post("/api/chat", json=payload)
             if resp.status_code == 400 and tools:
@@ -282,6 +284,7 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
     ) -> AsyncIterator[str]:
         payload: Dict[str, Any] = {
             "model": model,
+            "keep_alive": kwargs.get("keep_alive", "5m"),
             "messages": messages_to_dicts(messages),
             "stream": True,
             "options": _ollama_request_options(
@@ -381,6 +384,7 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
 
         payload: Dict[str, Any] = {
             "model": model,
+            "keep_alive": kwargs.get("keep_alive", "5m"),
             "messages": msg_dicts,
             "stream": True,
             "options": _ollama_request_options(
@@ -536,7 +540,23 @@ class OllamaEngine(AsyncHTTPEngineMixin, InferenceEngine):
             )
             return []
         data = resp.json()
-        return [m["name"] for m in data.get("models", [])]
+        entries = data.get("models", [])
+        # Compatibility migration can advertise a public name twice, plus a
+        # llamacpp:<manifest hash> child. Hide only a positively linked child;
+        # standalone/custom names remain selectable. Never modify the store.
+        public_digests = {
+            m.get("digest") for m in entries
+            if not m["name"].startswith("llamacpp:") and m.get("digest")
+        }
+        names = []
+        for entry in entries:
+            name = entry["name"]
+            if (name.startswith("llamacpp:")
+                    and name.removeprefix("llamacpp:") == entry.get("digest")
+                    and entry.get("digest") in public_digests):
+                continue
+            names.append(name)
+        return list(dict.fromkeys(names))
 
     def health(self) -> bool:
         try:

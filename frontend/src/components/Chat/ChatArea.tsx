@@ -62,6 +62,7 @@ export function ChatArea() {
     streamingConversationRef.current = isCurrentChatStreaming ? activeId : null;
 
     if (!justFinished) return;
+    if (tts.localCallActive) return;
     if (!voiceOutputEnabled || !voiceAutoplay) return;
 
     if (!last || last.role !== 'assistant' || activeId === null) return;
@@ -73,6 +74,7 @@ export function ChatArea() {
     void tts.ensureHealth().then(() => {
       const app = useAppStore.getState();
       const currentTts = useTtsStore.getState();
+      if (currentTts.localCallActive) return;
       const currentLast = app.messages[app.messages.length - 1];
       if (app.activeId !== completedConversationId || app.streamState.isStreaming) return;
       if (!app.settings.voiceOutputEnabled || !app.settings.voiceAutoplay) return;

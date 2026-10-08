@@ -11,6 +11,8 @@ export type TtsState = 'idle' | 'loading' | 'speaking';
  * normal case rather than the exception.
  */
 interface TtsStore {
+  localCallActive: boolean;
+  setLocalCallActive: (active: boolean) => void;
   state: TtsState;
   /** id of the message currently loading or speaking, if any. */
   speakingId: string | null;
@@ -74,6 +76,11 @@ function teardown(): void {
 }
 
 export const useTtsStore = create<TtsStore>((set, get) => ({
+  localCallActive: false,
+  setLocalCallActive: active => {
+    if (active) get().stop();
+    set({ localCallActive: active });
+  },
   state: 'idle',
   speakingId: null,
   error: null,
@@ -98,6 +105,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
   markAutoSpoken: (id: string) => set({ autoSpokenId: id }),
 
   speak: async (id: string, text: string) => {
+    if (get().localCallActive) return;
     const trimmed = text.trim();
     if (!trimmed) return;
 
@@ -165,5 +173,6 @@ export function __resetTtsForTests(): void {
     errorId: null,
     available: null,
     autoSpokenId: null,
+    localCallActive: false,
   });
 }

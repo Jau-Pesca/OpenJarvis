@@ -101,4 +101,6 @@ try:
 except Exception as exc:
     logger.debug("Registry alias 'react' creation skipped: %s", exc)
 
+import openjarvis.agents.business  # noqa: F401
+
 __all__ = ["AgentContext", "AgentResult", "BaseAgent", "ToolUsingAgent"]

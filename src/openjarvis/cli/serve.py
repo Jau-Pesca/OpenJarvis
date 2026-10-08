@@ -26,6 +26,14 @@ from openjarvis.intelligence import (
 
 logger = logging.getLogger(__name__)
 
+def _serving_engines(config, selected_name, selected_engine, *, pinned=None):
+    entries = [(selected_name, selected_engine)]
+    if not pinned:
+        entries.extend((name, backend) for name, backend in discover_engines(config)
+                       if name != selected_name)
+    return entries
+
+
 _DEFAULT_TOOLS = frozenset({"think", "calculator", "web_search"})
 
 
@@ -257,17 +265,16 @@ def serve(
     except Exception as exc:
         logger.debug("Engine instrumentation failed: %s", exc)
 
-    # Discover models
-    all_engines = discover_engines(config)
+    # Explicit --engine pins inference to that backend. In particular, an
+    # unrelated OpenAI-compatible endpoint must never hijack Ollama by
+    # advertising the same model name during discovery.
+    all_engines = _serving_engines(config, engine_name, engine, pinned=engine_key)
     all_models = discover_models(all_engines)
     for ek, model_ids in all_models.items():
         merge_discovered_models(ek, model_ids)
 
-    multi_entries = [(engine_name, engine)]
-    for discovered_name, discovered_engine in all_engines:
-        if discovered_name != engine_name:
-            multi_entries.append((discovered_name, discovered_engine))
-    if cloud_engine is not None:
+    multi_entries = list(all_engines)
+    if cloud_engine is not None and not engine_key:
         multi_entries.append(("cloud", cloud_engine))
 
     if len(multi_entries) > 1:

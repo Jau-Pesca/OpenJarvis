@@ -14,6 +14,11 @@ const apiTarget = process.env.OPENJARVIS_VITE_PROXY_TARGET
   || 'http://localhost:8000';
 
 export default defineConfig({
+  define: {
+    'import.meta.env.VITE_LOCAL_API_MANAGED': JSON.stringify(
+      process.env.OPENJARVIS_VITE_PROXY_TARGET ? 'true' : '',
+    ),
+  },
   resolve: {
     alias: {
       '@': path.resolve(import.meta.dirname, './src'),

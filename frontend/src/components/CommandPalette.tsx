@@ -5,7 +5,7 @@ import {
   pullModel,
   deleteModel,
   fetchModels,
-  preloadModel,
+  selectModel,
   isTauri,
   getCloudKeyStatus,
   saveCloudKey,
@@ -89,7 +89,10 @@ export function CommandPalette() {
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [tab, setTab] = useState<Tab>('installed');
   const [pulling, setPulling] = useState<string | null>(null);
+  const pullBusy = useRef(false);
+  const [pullStage, setPullStage] = useState<'downloading' | 'selecting' | null>(null);
   const [pullError, setPullError] = useState<string | null>(null);
+  const [modelsError, setModelsError] = useState<string | null>(null);
   const [pullSuccess, setPullSuccess] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [customModel, setCustomModel] = useState('');
@@ -105,6 +108,7 @@ export function CommandPalette() {
   const setSelectedModel = useAppStore((s) => s.setSelectedModel);
   const setModels = useAppStore((s) => s.setModels);
   const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
+  const modelLoading = useAppStore((s) => s.modelLoading);
 
   const installedIds = new Set(models.map((m) => m.id));
   const desktopKeyStorage = isTauri();
@@ -135,6 +139,7 @@ export function CommandPalette() {
 
   useEffect(() => {
     inputRef.current?.focus();
+    void refreshModels();
   }, []);
 
   useEffect(() => {
@@ -152,23 +157,31 @@ export function CommandPalette() {
     }
   }, [pullSuccess]);
 
-  const handleSelect = async (modelId: string, owner?: string) => {
+  const handleSelect = async (modelId: string, owner?: string, fromDownload = false) => {
+    if (useAppStore.getState().modelLoading || pullBusy.current && !fromDownload) return false;
     const previousModel = selectedModel;
-    setSelectedModel(modelId);
-    setCommandPaletteOpen(false);
+    setPullError(null);
 
     if (modelId !== previousModel) {
       const { setModelLoading, addLogEntry } = useAppStore.getState();
       setModelLoading(true);
       addLogEntry({ timestamp: Date.now(), level: 'info', category: 'model', message: `Switching to ${modelId}...` });
       try {
-        await preloadModel(modelId, owner);
-        addLogEntry({ timestamp: Date.now(), level: 'info', category: 'model', message: `${modelId} loaded` });
+        await selectModel(modelId, owner);
+        setSelectedModel(modelId);
+        setCommandPaletteOpen(false);
+        addLogEntry({ timestamp: Date.now(), level: 'info', category: 'model', message: `${modelId} selecionado. Será carregado no primeiro envio.` });
+        return true;
       } catch (e: any) {
+        setPullError(`Não consegui selecionar ${modelId}: ${e.message}`);
         addLogEntry({ timestamp: Date.now(), level: 'error', category: 'model', message: `Failed to load ${modelId}: ${e.message}` });
+        return false;
       } finally {
         setModelLoading(false);
       }
+    } else {
+      setCommandPaletteOpen(false);
+      return true;
     }
   };
 
@@ -176,11 +189,17 @@ export function CommandPalette() {
     try {
       const m = await fetchModels();
       setModels(m);
-    } catch {}
+      setModelsError(null);
+    } catch {
+      setModelsError('Não consegui consultar os modelos. Confira a conexão com o servidor.');
+    }
   };
 
   const handlePull = async (modelId: string) => {
+    if (pullBusy.current || useAppStore.getState().modelLoading) return false;
+    pullBusy.current = true;
     setPulling(modelId);
+    setPullStage('downloading');
     setPullError(null);
     try {
       await pullModel(modelId);
@@ -190,15 +209,19 @@ export function CommandPalette() {
         message: `Downloaded ${modelId}`,
       });
       await refreshModels();
-      setSelectedModel(modelId);
+      setPullStage('selecting');
+      return await handleSelect(modelId, undefined, true);
     } catch (e: any) {
-      setPullError(e.message || 'Download failed');
+      setPullError(e.message || 'Não consegui baixar o modelo.');
       useAppStore.getState().addLogEntry({
         timestamp: Date.now(), level: 'error', category: 'model',
         message: `Download failed for ${modelId}: ${e.message}`,
       });
+      return false;
     } finally {
+      pullBusy.current = false;
       setPulling(null);
+      setPullStage(null);
     }
   };
 
@@ -222,9 +245,8 @@ export function CommandPalette() {
 
   const handleCustomPull = async () => {
     const name = customModel.trim();
-    if (!name) return;
-    await handlePull(name);
-    setCustomModel('');
+    if (!name || pullBusy.current || modelLoading) return;
+    if (await handlePull(name)) setCustomModel('');
   };
 
   const handleSaveKey = async (provider: CloudProvider, value: string) => {
@@ -270,14 +292,15 @@ export function CommandPalette() {
   };
 
   const TAB_LABELS: Record<Tab, string> = {
-    installed: `Installed Models (${models.length})`,
-    catalogue: 'Download',
-    cloud: 'Cloud Models',
+    installed: `Modelos instalados (${models.length})`,
+    catalogue: 'Downloads',
+    cloud: 'Modelos de nuvem',
   };
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+      className="notranslate fixed inset-0 z-50 flex items-start justify-center pt-[15vh]"
+      translate="no" lang="pt-BR" role="dialog" aria-label="Selecionar modelo"
       onClick={() => setCommandPaletteOpen(false)}
     >
       <div className="fixed inset-0" style={{ background: 'rgba(0,0,0,0.5)' }} />
@@ -304,7 +327,7 @@ export function CommandPalette() {
                 background: 'transparent',
               }}
             >
-              {TAB_LABELS[t]}
+              <span>{TAB_LABELS[t]}</span>
             </button>
           ))}
         </div>
@@ -322,7 +345,7 @@ export function CommandPalette() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={tab === 'installed' ? 'Search installed models...' : 'Search models to download...'}
+              placeholder={tab === 'installed' ? 'Pesquisar modelos instalados…' : 'Pesquisar modelos para baixar…'}
               className="flex-1 bg-transparent outline-none text-sm"
               style={{ color: 'var(--color-text)' }}
             />
@@ -337,6 +360,13 @@ export function CommandPalette() {
         )}
 
         {/* Status messages */}
+        {modelsError && (
+          <div className="px-4 py-2 text-xs" role="alert" style={{ color: 'var(--color-error)' }}>
+            <span>{modelsError}</span>
+            <button onClick={() => void refreshModels()} className="ml-2 underline cursor-pointer"><span>Tentar novamente</span></button>
+          </div>
+        )}
+        {modelLoading && <div className="px-4 py-2 text-xs" role="status"><span>Atualizando seleção…</span></div>}
         {pullError && (
           <div className="px-4 py-2 text-xs" style={{ color: 'var(--color-error)', background: 'rgba(220,38,38,0.05)' }}>
             {pullError}
@@ -344,7 +374,7 @@ export function CommandPalette() {
         )}
         {pullSuccess && (
           <div className="px-4 py-2 text-xs flex items-center gap-1.5" style={{ color: 'var(--color-success)', background: 'color-mix(in srgb, var(--color-success) 5%, transparent)' }}>
-            <Check size={12} /> Downloaded {pullSuccess} successfully
+            <Check size={12} /> <span>{pullSuccess} instalado com sucesso</span>
           </div>
         )}
         {tab === 'cloud' && cloudKeyError && (
@@ -359,8 +389,8 @@ export function CommandPalette() {
             filtered.length === 0 ? (
               <div className="px-4 py-6 text-center text-sm" style={{ color: 'var(--color-text-tertiary)' }}>
                 {models.length === 0
-                  ? 'No models available — switch to "Download" to get started'
-                  : 'No matching models'}
+                  ? 'Nenhum modelo disponível — abra Downloads para instalar'
+                  : 'Nenhum modelo encontrado'}
               </div>
             ) : (
               (filtered as typeof models).map((model, idx) => {
@@ -376,6 +406,7 @@ export function CommandPalette() {
                   >
                     <button
                       onClick={() => handleSelect(model.id, model.owned_by)}
+                      disabled={modelLoading || !!pulling}
                       className="flex items-center gap-3 flex-1 min-w-0 text-left cursor-pointer"
                       style={{ background: 'none', border: 'none', padding: 0 }}
                     >
@@ -391,7 +422,7 @@ export function CommandPalette() {
                       </div>
                       {isActive && (
                         <span className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: 'var(--color-accent-subtle)', color: 'var(--color-accent)' }}>
-                          Active
+                          Ativo
                         </span>
                       )}
                     </button>
@@ -401,7 +432,7 @@ export function CommandPalette() {
                         disabled={isDeleting}
                         className="p-1 rounded transition-colors cursor-pointer"
                         style={{ color: 'var(--color-text-tertiary)', opacity: 0 }}
-                        title="Delete model"
+                        title="Excluir modelo"
                         onMouseEnter={(e) => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.color = 'var(--color-error)'; }}
                         onMouseLeave={(e) => { e.currentTarget.style.opacity = '0'; e.currentTarget.style.color = 'var(--color-text-tertiary)'; }}
                       >
@@ -434,32 +465,39 @@ export function CommandPalette() {
                         opacity: (isPulling || (pulling && !isPulling)) ? 0.5 : 1,
                       }}
                     >
-                      {isPulling ? <><Loader2 size={12} className="animate-spin" /> Downloading...</> :
-                       justInstalled ? <><Check size={12} /> Installed</> :
-                       <><Download size={12} /> Download</>}
+                      {isPulling ? <><Loader2 size={12} className="animate-spin" /> <span>Baixando…</span></> :
+                       justInstalled ? <><Check size={12} /> <span>Instalado</span></> :
+                       <><Download size={12} /> <span>Baixar</span></>}
                     </button>
                   </div>
                 );
               })}
               <div className="px-4 py-3 mt-1" style={{ borderTop: '1px solid var(--color-border)' }}>
-                <div className="text-[11px] mb-2" style={{ color: 'var(--color-text-tertiary)' }}>Or enter any Ollama model name:</div>
+                <div className="text-[11px] mb-2" style={{ color: 'var(--color-text-tertiary)' }}>Ou informe o nome de um modelo do Ollama:</div>
                 <div className="flex gap-2">
                   <input
                     type="text" value={customModel}
+                    disabled={!!pulling || modelLoading}
                     onChange={(e) => setCustomModel(e.target.value)}
                     onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleCustomPull(); } }}
-                    placeholder="e.g. codellama:7b"
+                    placeholder="Ex.: codellama:7b"
                     className="flex-1 text-sm px-3 py-1.5 rounded-lg outline-none"
                     style={{ background: 'var(--color-bg-secondary)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
                   />
                   <button
-                    onClick={handleCustomPull} disabled={!customModel.trim() || !!pulling}
+                    onClick={handleCustomPull} disabled={!customModel.trim() || !!pulling || modelLoading}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer"
                     style={{ background: 'var(--color-accent)', color: 'var(--color-on-accent)', opacity: (!customModel.trim() || pulling) ? 0.5 : 1 }}
                   >
-                    <Download size={12} /> Pull
+                    {pulling ? <><Loader2 size={12} className="animate-spin" /><span>{pullStage === 'selecting' ? 'Selecionando…' : 'Baixando…'}</span></> : <><Download size={12} /><span>Baixar</span></>}
                   </button>
                 </div>
+                {pulling && (
+                  <div role="status" aria-live="polite" className="mt-3 text-xs" style={{ color: 'var(--color-accent)' }}>
+                    <span>{pullStage === 'selecting' ? `Download de ${pulling} concluído. Selecionando modelo; ele será carregado no primeiro envio.` : `Baixando ${pulling}… Isso pode levar alguns minutos. Aguardando a confirmação do Ollama.`}</span>
+                  </div>
+                )}
+                {pullError && <div role="alert" className="mt-3 text-xs" style={{ color: 'var(--color-error)' }}><span>{pullError}</span></div>}
               </div>
             </>
           ) : (
@@ -467,8 +505,8 @@ export function CommandPalette() {
             <div className="px-4 py-2">
               <div className="text-[11px] mb-3" style={{ color: 'var(--color-text-tertiary)' }}>
                 {desktopKeyStorage
-                  ? 'Add your API keys to use cloud models. Keys are stored in secure desktop storage.'
-                  : 'Configure cloud provider keys in the server environment to use cloud models.'}
+                  ? 'Adicione suas chaves para usar modelos de nuvem. As chaves ficam no armazenamento seguro do aplicativo.'
+                  : 'Configure as chaves dos provedores no servidor para usar modelos de nuvem.'}
               </div>
 
               {CLOUD_PROVIDERS.map((provider) => {
@@ -485,7 +523,7 @@ export function CommandPalette() {
                       <span className="text-xs font-medium" style={{ color: 'var(--color-text)' }}>{provider.name}</span>
                       {hasKey && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded-full" style={{ background: 'color-mix(in srgb, var(--color-success) 10%, transparent)', color: 'var(--color-success)' }}>
-                          Connected
+                          Conectado
                         </span>
                       )}
                     </div>
@@ -499,7 +537,7 @@ export function CommandPalette() {
                           value={key}
                           onChange={(e) => setApiKeys((prev) => ({ ...prev, [provider.envKey]: e.target.value }))}
                           onBlur={() => handleKeyBlur(provider)}
-                          placeholder={hasSavedKey ? 'Saved in secure storage' : provider.envKey}
+                          placeholder={hasSavedKey ? 'Salva no armazenamento seguro' : provider.envKey}
                           disabled={!desktopKeyStorage || isSaving}
                           className="flex-1 text-xs px-2 py-1.5 bg-transparent outline-none font-mono"
                           style={{ color: 'var(--color-text)' }}
@@ -518,7 +556,7 @@ export function CommandPalette() {
                           className="px-2 py-1 rounded-lg text-[10px] cursor-pointer"
                           style={{ color: 'var(--color-error)', border: '1px solid var(--color-error)', opacity: isSaving ? 0.5 : 1 }}
                         >
-                          {isSaving ? 'Saving' : 'Remove'}
+                          {isSaving ? 'Salvando' : 'Remover'}
                         </button>
                       )}
                     </div>
@@ -532,6 +570,7 @@ export function CommandPalette() {
                             <button
                               key={model.id}
                               onClick={() => handleSelect(model.id)}
+                              disabled={modelLoading || !!pulling}
                               className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-left cursor-pointer transition-colors"
                               style={{ background: isActive ? 'var(--color-accent-subtle)' : 'transparent' }}
                               onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = 'var(--color-bg-secondary)'; }}
@@ -548,7 +587,7 @@ export function CommandPalette() {
                               </div>
                               {isActive && (
                                 <span className="text-[9px] px-1.5 py-0.5 rounded-full shrink-0" style={{ background: 'var(--color-accent-subtle)', color: 'var(--color-accent)' }}>
-                                  Active
+                                  Ativo
                                 </span>
                               )}
                             </button>
@@ -570,14 +609,14 @@ export function CommandPalette() {
         >
           {tab === 'installed' ? (
             <>
-              <span><kbd className="font-mono">↑↓</kbd> Navigate</span>
-              <span><kbd className="font-mono">Enter</kbd> Select</span>
-              <span><kbd className="font-mono">Esc</kbd> Close</span>
+              <span><kbd className="font-mono">↑↓</kbd><span> Navegar</span></span>
+              <span><kbd className="font-mono">Enter</kbd><span> Selecionar</span></span>
+              <span><kbd className="font-mono">Esc</kbd><span> Fechar</span></span>
             </>
           ) : tab === 'catalogue' ? (
-            <span>Models are downloaded from the Ollama registry</span>
+            <span>Os modelos são baixados do catálogo do Ollama</span>
           ) : (
-            <span>API keys are stored locally and never sent to OpenJarvis servers</span>
+            <span>As chaves ficam armazenadas localmente e não são enviadas aos servidores do OpenJarvis</span>
           )}
         </div>
       </div>

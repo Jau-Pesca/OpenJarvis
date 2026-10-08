@@ -70,6 +70,14 @@ const getSettingsApiUrl = (): string => {
 
 export const getBase = (): string => {
   const settingsUrl = getSettingsApiUrl();
+  // The local launcher selects free ports. An old loopback setting must not
+  // bypass its same-origin proxy; deliberate remote settings stay supported.
+  if (!isTauri() && import.meta.env.VITE_LOCAL_API_MANAGED === 'true') {
+    try {
+      const url = new URL(settingsUrl);
+      if (['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return '';
+    } catch { /* Empty or invalid setting follows the existing resolution. */ }
+  }
   if (settingsUrl) return settingsUrl;
   if (import.meta.env.VITE_API_URL) return import.meta.env.VITE_API_URL;
   if (isTauri()) return _tauriApiBase || DESKTOP_API_FALLBACK;
@@ -216,8 +224,8 @@ export async function pullModel(modelName: string): Promise<void> {
     body: JSON.stringify({ model: modelName }),
   });
   if (!res.ok) {
-    const detail = await res.text().catch(() => res.statusText);
-    throw new Error(`Failed to pull model: ${detail}`);
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `Não consegui baixar o modelo (HTTP ${res.status}).`);
   }
 }
 
@@ -242,21 +250,34 @@ export async function deleteModel(modelName: string): Promise<void> {
 
 const _CLOUD_PREFIXES = ['gpt-', 'o1-', 'o3-', 'o4-', 'claude-', 'gemini-', 'openrouter/'];
 
+export async function selectModel(modelName: string, owner?: string): Promise<void> {
+  if (isTauri() || owner === 'litellm' || modelName !== 'gpt-oss' && !modelName.startsWith('gpt-oss:') && _CLOUD_PREFIXES.some(p => modelName.startsWith(p))) return;
+  const response = await apiFetch('/v1/models/select', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: modelName }),
+  });
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({}));
+    throw new Error(detail.detail || 'Não consegui selecionar o modelo.');
+  }
+}
+
 export async function preloadModel(modelName: string, owner?: string): Promise<void> {
   // Cloud models don't need Ollama preloading
   if (owner === 'litellm' || _CLOUD_PREFIXES.some(p => modelName.startsWith(p))) {
     return;
   }
-  // Trigger Ollama to load the model into memory (empty prompt, no generation).
-  const ollamaUrl = 'http://127.0.0.1:11434';
   try {
-    const res = await fetch(`${ollamaUrl}/api/generate`, {
+    const res = await apiFetch('/v1/models/preload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: modelName, prompt: '', keep_alive: '5m' }),
-      signal: AbortSignal.timeout(120_000),
+      body: JSON.stringify({ model: modelName }),
+      signal: AbortSignal.timeout(125_000),
     });
-    if (!res.ok) throw new Error(`Preload failed: ${res.status}`);
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail.detail || `Preload failed: ${res.status}`);
+    }
   } catch (e: any) {
     if (e.name === 'TimeoutError') throw new Error('Model load timed out (120s)');
     throw e;

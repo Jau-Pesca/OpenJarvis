@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import os
+from pathlib import Path
 from typing import Any
 
 from openjarvis.core.registry import ToolRegistry
@@ -28,8 +30,18 @@ class _BrowserSession:
                 "playwright not installed. Install with: uv sync --extra browser"
             )
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
-        self._page = self._browser.new_page()
+        profile = os.environ.get("OJ_BROWSER_PROFILE")
+        if profile:
+            Path(profile).mkdir(parents=True, exist_ok=True)
+            self._browser = self._playwright.chromium.launch_persistent_context(
+                profile, headless=os.environ.get("OJ_BROWSER_HEADLESS", "1") != "0",
+            )
+            self._page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
+        else:
+            self._browser = self._playwright.chromium.launch(headless=True)
+            self._page = self._browser.new_page()
+        self._page.set_default_timeout(15000)
+        self._page.set_default_navigation_timeout(25000)
 
     @property
     def page(self):

@@ -20,6 +20,7 @@ from openjarvis.server.dashboard import dashboard_router
 from openjarvis.server.digest_routes import create_digest_router
 from openjarvis.server.research_router import router as research_router
 from openjarvis.server.routes import router
+from openjarvis.server.local_call import LocalCall, create_local_call_router
 from openjarvis.server.upload_router import router as upload_router
 
 logger = logging.getLogger(__name__)
@@ -490,6 +491,24 @@ def create_app(
                     svc.stop()
                 except Exception:
                     pass
+
+    local_call = LocalCall()
+    from openjarvis.agents.task_runtime import TaskManager
+    from openjarvis.server.business_tasks import create_business_task_router
+    task_manager = TaskManager(agent) if getattr(agent, "agent_id", "") == "business" else None
+    app.state.business_tasks = task_manager
+    app.include_router(create_business_task_router(task_manager))
+    app.state.local_call = local_call
+    app.include_router(create_local_call_router(local_call))
+
+    @app.on_event("shutdown")
+    async def _shutdown_local_call() -> None:
+        import asyncio
+        if task_manager is not None:
+            task_manager.close()
+        current = local_call.snapshot()
+        if current["active"]:
+            await asyncio.to_thread(local_call.stop, current["call_id"])
 
     app.include_router(router)
     app.include_router(dashboard_router)

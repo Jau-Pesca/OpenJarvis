@@ -33,6 +33,14 @@ afterEach(() => {
 });
 
 describe('setModels', () => {
+  it('restores an explicitly selected model after reloading the store', async () => {
+    const first = await import('./store');
+    first.useAppStore.getState().setSelectedModel('qwen3.5:4b');
+    vi.resetModules();
+    const { useAppStore } = await import('./store');
+    useAppStore.getState().setModels([model('qwen3.5:9b'), model('qwen3.5:4b')]);
+    expect(useAppStore.getState().selectedModel).toBe('qwen3.5:4b');
+  });
   it('does not select an embedding-only model', async () => {
     const { useAppStore } = await import('./store');
 

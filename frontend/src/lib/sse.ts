@@ -5,6 +5,7 @@ export interface ChatRequest {
   model: string;
   messages: Array<{ role: string; content: string }>;
   stream: true;
+  session_id?: string;
   temperature?: number;
   max_tokens?: number;
 }

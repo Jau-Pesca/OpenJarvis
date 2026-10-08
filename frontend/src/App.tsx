@@ -12,7 +12,7 @@ import { CommandPalette } from './components/CommandPalette';
 import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
-import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
+import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri, selectModel } from './lib/api';
 import { OptInModal } from './components/OptInModal';
 import { UpdateChecker } from './components/Desktop/UpdateChecker';
 import { track, hashId } from './lib/analytics';
@@ -69,6 +69,17 @@ export default function App() {
     fetchModels()
       .then((m) => {
         setModels(m);
+        // Restore the saved selection without loading any model into memory.
+        if (!isTauri() && import.meta.env.VITE_LOCAL_API_MANAGED === 'true') {
+          const store = useAppStore.getState();
+          const selected = m.find(model => model.id === store.selectedModel);
+          if (selected) {
+            store.setModelLoading(true);
+            void selectModel(selected.id, selected.owned_by).catch(error => {
+              store.addLogEntry({ timestamp: Date.now(), level: 'error', category: 'model', message: `Não consegui restaurar o modelo: ${error.message}` });
+            }).finally(() => store.setModelLoading(false));
+          }
+        }
       })
       .catch(() => setModels([]))
       .finally(() => setModelsLoading(false));

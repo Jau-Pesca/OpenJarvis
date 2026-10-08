@@ -11,6 +11,7 @@ import {
   resolveChatEngine,
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
+import { LocalCallPanel } from './LocalCallPanel';
 import { useSpeech } from '../../hooks/useSpeech';
 import type {
   ChatMessage,
@@ -81,6 +82,7 @@ function useResearchCorpusSync(enabled: boolean): {
 
 export function InputArea() {
   const [input, setInput] = useState('');
+  const [localCallActive, setLocalCallActive] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -127,7 +129,7 @@ export function InputArea() {
     prevModelRef.current = selectedModel;
   }, [selectedModel, streamState.isStreaming, resetStream]);
 
-  const micDisabled = !speechEnabled || !speechAvailable || streamState.isStreaming;
+  const micDisabled = localCallActive || !speechEnabled || !speechAvailable || streamState.isStreaming;
   const micReason: 'not-enabled' | 'no-backend' | 'streaming' | undefined =
     !speechEnabled ? 'not-enabled'
     : !speechAvailable ? 'no-backend'
@@ -173,7 +175,7 @@ export function InputArea() {
 
   const sendMessage = useCallback(async () => {
     const content = input.trim();
-    if (!content || streamState.isStreaming) return;
+    if (!content || streamState.isStreaming || localCallActive) return;
     if (!selectedModel) {
       toast.error('Pick a model first (⌘K)');
       return;
@@ -376,7 +378,7 @@ export function InputArea() {
         }
       } else {
       for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
+        { model: selectedModel, messages: apiMessages, stream: true, session_id: `chat-${convId}`, temperature, max_tokens: maxTokens },
         controller.signal,
       )) {
         const eventName = sseEvent.event;
@@ -541,6 +543,7 @@ export function InputArea() {
     }
   }, [
     input,
+    localCallActive,
     activeId,
     selectedModel,
     streamState.isStreaming,
@@ -563,12 +566,13 @@ export function InputArea() {
 
   return (
     <div className="px-4 pb-4 pt-2" style={{ maxWidth: 'var(--chat-max-width)', margin: '0 auto', width: '100%' }}>
+      <LocalCallPanel disabled={speechState !== 'idle'} onActiveChange={setLocalCallActive} />
       <div className="mb-2 flex flex-col gap-1">
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={() => setDeepResearch(!deepResearch)}
-            disabled={streamState.isStreaming}
+            disabled={streamState.isStreaming || localCallActive}
             aria-pressed={deepResearch}
             className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs transition-colors cursor-pointer disabled:cursor-default disabled:opacity-50"
             style={{
@@ -612,7 +616,7 @@ export function InputArea() {
           rows={1}
           className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
           style={{ color: 'var(--color-text)', maxHeight: '200px' }}
-          disabled={streamState.isStreaming || modelLoading}
+          disabled={streamState.isStreaming || modelLoading || localCallActive}
         />
         {isCurrentChatStreaming ? (
           <button
@@ -633,7 +637,7 @@ export function InputArea() {
             />
             <button
               onClick={sendMessage}
-              disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel}
+              disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel || localCallActive}
               title={selectedModel ? 'Send message' : 'Pick a model first (⌘K)'}
               className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-default"
               style={{

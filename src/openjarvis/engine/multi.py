@@ -35,8 +35,12 @@ class MultiEngine(InferenceEngine):
         for key, engine in self._engines:
             try:
                 for model_id in engine.list_models():
-                    self._model_map[model_id] = engine
-                    self._model_key_map[model_id] = key
+                    # Entries are ordered with the selected engine first.
+                    # Discovery must not replace it with an API-compatible
+                    # server advertising the same model identifier.
+                    if model_id not in self._model_map:
+                        self._model_map[model_id] = engine
+                        self._model_key_map[model_id] = key
             except Exception as exc:
                 logger.debug("Failed to list models for %s: %s", key, exc)
 
@@ -54,7 +58,7 @@ class MultiEngine(InferenceEngine):
             return engine
         # If model looks like a cloud model, route to the cloud engine
         # rather than falling back to the local engine (which would 404).
-        if any(model.startswith(p) for p in self._CLOUD_PREFIXES):
+        if not (model == 'gpt-oss' or model.startswith('gpt-oss:')) and any(model.startswith(p) for p in self._CLOUD_PREFIXES):
             for key, eng in self._engines:
                 if key == "cloud":
                     logger.info("Routing cloud model %r to cloud engine", model)

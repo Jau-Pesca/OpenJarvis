@@ -11,6 +11,13 @@ import { useTtsStore, __resetTtsForTests, shouldAutoplayFinishedReply } from './
 const synth = vi.mocked(synthesizeSpeech);
 const health = vi.mocked(fetchTtsHealth);
 
+it('blocks browser playback while the local call owns the audio output', async () => {
+  useTtsStore.getState().setLocalCallActive(true);
+  await useTtsStore.getState().speak('reply', 'Resultado');
+  expect(synth).not.toHaveBeenCalled();
+  expect(useTtsStore.getState().state).toBe('idle');
+});
+
 /** Minimal HTMLAudioElement stand-in; jsdom cannot decode or play real audio. */
 class FakeAudio {
   static instances: FakeAudio[] = [];

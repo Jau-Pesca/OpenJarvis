@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import uuid
 import weakref
@@ -306,6 +307,7 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
                 trace_store=getattr(request.app.state, "trace_store", None),
                 bus=getattr(request.app.state, "bus", None),
                 memory_service=getattr(request.app.state, "memory_service", None),
+                task_manager=getattr(request.app.state, "business_tasks", None),
             )
         return await _handle_stream(
             engine,
@@ -680,6 +682,7 @@ async def _handle_agent_stream(
     trace_store=None,
     bus=None,
     memory_service=None,
+    task_manager=None,
 ):
     """Run the configured agent and return its result as an SSE response.
 
@@ -708,15 +711,56 @@ async def _handle_agent_stream(
         yield f"data: {first_chunk.model_dump_json()}\n\n"
 
         try:
-            response = await asyncio.to_thread(
-                _handle_agent,
-                agent,
-                model,
-                req,
-                complexity_info,
-                trace_store=trace_store,
-                bus=bus,
-            )
+            submitted = None
+            acknowledgement_text = ""
+            if task_manager is not None:
+                submitted = await asyncio.to_thread(task_manager.message, query_text, req.session_id or "chat",
+                    history=[{"role": m.role, "content": m.content} for m in req.messages[:-1]], model=model)
+                acknowledgement_text = submitted["acknowledgement"]
+            if getattr(agent, "agent_id", "") == "business" and submitted and submitted["action"] in {"queued", "redirected"}:
+                # The mailbox owns ongoing execution; finish this chat turn so
+                # the user can speak again while results arrive in its panel.
+                response = ChatCompletionResponse(model=model, choices=[Choice(message=ChoiceMessage(role="assistant", content=acknowledgement_text), finish_reason="stop")])
+            elif submitted and submitted["action"] == "chat":
+                response = ChatCompletionResponse(model=model, choices=[Choice(message=ChoiceMessage(role="assistant", content=submitted["response"]), finish_reason="stop")])
+            elif submitted and submitted["action"] == "chat_pending":
+                while True:
+                    message = next((m for m in task_manager.dialogue_snapshot(req.session_id or "chat") if m["id"] == submitted["message_id"]), None)
+                    if message is None:
+                        raise RuntimeError("A conversa não está mais disponível.")
+                    if message["state"] in {"done", "error", "cancelled"}:
+                        content = message["result"] if message["state"] == "done" else "" if message["state"] == "cancelled" else "Ocorreu um erro ao processar sua mensagem: " + message.get("error", "Erro sem detalhes.")
+                        if message["state"] == "done" and message.get("task_id") and getattr(agent, "agent_id", "") != "business":
+                            acknowledgement = ChatCompletionChunk(id=chunk_id, model=model, choices=[StreamChoice(delta=DeltaMessage(content=content + "\n\n"))])
+                            yield f"data: {acknowledgement.model_dump_json()}\n\n"
+                            while True:
+                                task = next((t for t in task_manager.snapshot(req.session_id or "chat") if t["id"] == message["task_id"]), None)
+                                if task is None:
+                                    raise RuntimeError("A tarefa não está mais disponível.")
+                                if task["state"] in {"done", "error", "cancelled"}:
+                                    content = task["result"] if task["state"] == "done" else task["error"] if task["state"] == "error" else "Tarefa cancelada."
+                                    break
+                                await asyncio.sleep(0.15)
+                        response = ChatCompletionResponse(model=model, choices=[Choice(message=ChoiceMessage(role="assistant", content=content), finish_reason="stop")])
+                        break
+                    await asyncio.sleep(0.15)
+            elif submitted:
+                while True:
+                    task = next((t for t in task_manager.snapshot(req.session_id or "chat") if t["id"] == submitted["task_id"]), None)
+                    if task is None:
+                        raise RuntimeError("A tarefa não está mais disponível.")
+                    if task["state"] in {"done", "error", "cancelled"}:
+                        content = task["result"] if task["state"] == "done" else "Tarefa cancelada." if task["state"] == "cancelled" else "Não consegui concluir a tarefa: " + task["error"]
+                        response = ChatCompletionResponse(model=model,
+                            choices=[Choice(message=ChoiceMessage(role="assistant", content=content), finish_reason="stop")],
+                            usage=UsageInfo(**task["usage"]))
+                        break
+                    await asyncio.sleep(0.25)
+            else:
+                response = await asyncio.to_thread(
+                    _handle_agent, agent, model, req, complexity_info,
+                    trace_store=trace_store, bus=bus,
+                )
         except Exception as exc:
             logging.getLogger("openjarvis.server").error(
                 "Agent stream error: %s",
@@ -1131,7 +1175,6 @@ async def list_models(request: Request) -> ModelListResponse:
     # memory/retrieval via the embedder path; putting them in /v1/models made
     # the UI auto-select nomic-embed-text and fail every generation with 400.
     model_ids = [m for m in model_ids if not is_embed_only_model(m)]
-
     return ModelListResponse(
         data=[
             ModelObject(
@@ -1147,6 +1190,81 @@ async def list_models(request: Request) -> ModelListResponse:
     )
 
 
+def _find_ollama_engine(engine: Any) -> Any | None:
+    """Find the local backend inside routing and instrumentation wrappers."""
+    pending = [engine]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        host = getattr(current, "_host", None)
+        if getattr(current, "engine_id", "") == "ollama" and isinstance(host, str):
+            return current
+        attributes = vars(current) if hasattr(current, "__dict__") else {}
+        for name in ("_inner", "_engine"):
+            wrapped = attributes.get(name)
+            if wrapped is not None:
+                pending.append(wrapped)
+        entries = attributes.get("_engines", [])
+        for key, backend in reversed(entries):
+            if key == "ollama":
+                pending.append(backend)
+    return None
+
+
+@router.post("/v1/models/preload")
+async def preload_model(request: Request):
+    """Load a local model through the configured backend, avoiding browser CORS."""
+    body = await request.json()
+    model_name = body.get("model") if isinstance(body, dict) else None
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise HTTPException(status_code=400, detail="'model' field is required")
+    model_name = model_name.strip()
+    engine = _find_ollama_engine(request.app.state.engine)
+    if engine is None:
+        raise HTTPException(status_code=501, detail="Model loading requires an Ollama engine")
+    import httpx as _httpx
+    from contextlib import nullcontext
+    from openjarvis.server.model_residency import preload_and_select
+    agent = getattr(request.app.state, 'agent', None)
+    model_lock = _get_agent_model_lock(agent) if agent is not None else nullcontext()
+    try:
+        residency = await asyncio.to_thread(preload_and_select, request.app.state, engine, model_name, model_lock)
+    except (_httpx.ConnectError, _httpx.TimeoutException) as exc:
+        raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
+    except _httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=f"Ollama error: {exc.response.text[:300]}")
+    return {'status': 'ok', 'model': model_name, **residency}
+
+
+@router.post('/v1/models/select')
+async def select_model(request: Request):
+    """Change the local default without loading it; inference loads on demand."""
+    from contextlib import nullcontext
+    from openjarvis.server.model_residency import select_without_loading
+    body = await request.json()
+    model = body.get('model') if isinstance(body, dict) else None
+    engine = request.app.state.engine
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(400, "'model' field is required")
+    model = model.strip()
+    if model not in await asyncio.to_thread(engine.list_models):
+        raise HTTPException(400, 'O modelo não está instalado. Use Downloads primeiro.')
+    backend = _find_ollama_engine(engine)
+    if backend is None:
+        return {'status': 'ok', 'model': model, 'unloaded': [], 'retained': []}
+    agent = getattr(request.app.state, 'agent', None)
+    lock = _get_agent_model_lock(agent) if agent is not None else nullcontext()
+    import httpx
+    try:
+        residency = await asyncio.to_thread(select_without_loading, request.app.state, backend, model, lock)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        raise HTTPException(502, 'Não consegui atualizar a seleção de modelos.') from error
+    return {'status': 'ok', 'model': model, **residency}
+
+
 @router.post("/v1/models/pull")
 async def pull_model(request: Request):
     """Pull / download a model from the Ollama registry."""
@@ -1155,10 +1273,8 @@ async def pull_model(request: Request):
     if not model_name:
         raise HTTPException(status_code=400, detail="'model' field is required")
 
-    engine = request.app.state.engine
-    engine_name = getattr(request.app.state, "engine_name", "")
-    # Only Ollama supports pulling
-    if engine_name != "ollama" and getattr(engine, "engine_id", "") != "ollama":
+    engine = _find_ollama_engine(request.app.state.engine)
+    if engine is None:
         raise HTTPException(
             status_code=501,
             detail="Model pulling is only supported with the Ollama engine",
@@ -1173,14 +1289,31 @@ async def pull_model(request: Request):
                 "/api/pull",
                 json={"name": model_name, "stream": False},
             )
-        resp.raise_for_status()
-    except (_httpx.ConnectError, _httpx.TimeoutException) as exc:
+            resp.raise_for_status()
+            result = resp.json()
+            if not isinstance(result, dict) or result.get('error') or result.get('status') != 'success':
+                detail = result.get('error') if isinstance(result, dict) else None
+                raise HTTPException(status_code=502, detail=str(detail or 'O Ollama não confirmou a conclusão do download.'))
+            installed = await client.get('/api/tags')
+            installed.raise_for_status()
+            inventory = installed.json()
+            if not isinstance(inventory, dict) or not isinstance(inventory.get('models'), list):
+                raise ValueError('Invalid model inventory')
+            names = {m['name'] for m in inventory['models'] if isinstance(m, dict) and isinstance(m.get('name'), str)}
+            canonical = model_name if ':' in model_name.rsplit('/', 1)[-1] else model_name + ':latest'
+            if model_name not in names and canonical not in names:
+                raise HTTPException(status_code=502, detail='O download terminou, mas o modelo não apareceu nos instalados. Atualize a lista antes de tentar novamente.')
+    except _httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail='O download não foi confirmado dentro do prazo. Confira os modelos instalados antes de tentar novamente.') from exc
+    except _httpx.ConnectError as exc:
         raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
     except _httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=exc.response.status_code,
             detail=f"Ollama error: {exc.response.text[:300]}",
         )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail='O Ollama retornou uma confirmação de download inválida.') from exc
 
     return {"status": "ok", "model": model_name}
 
